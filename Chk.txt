@@ -1,0 +1,185 @@
+Search Project – Semantic & Hybrid Search on Conversations
+
+Overview
+
+This project implements semantic search over customer conversation data using embeddings stored in BigQuery.
+
+At a high level, it:
+	•	Generates embeddings for historical and new conversations
+	•	Runs cosine similarity search in BigQuery
+	•	Returns the top-K most relevant results under a similarity threshold
+	•	Supports offline evaluation of search quality
+	•	Optionally supports Python-based clustering on search results
+
+This project is designed to be:
+	•	Simple
+	•	Easy to run from JupyterLab or scheduled jobs
+	•	Easy to hand off to IT for orchestration
+
+⸻
+
+High-Level Flow
+
+Conversation data (BigQuery)
+        ↓
+Embedding generation (BigQuery SQL)
+        ↓
+Embeddings table
+        ↓
+User query
+        ↓
+Search query (cosine similarity in BigQuery)
+        ↓
+Top-K results
+        ↓
+(Optional) clustering + evaluation in Python
+
+
+⸻
+
+Project Structure
+
+search/
+│
+├── README.md
+│   Project overview and usage instructions
+│
+├── config.py
+│   Central configuration:
+│   - BigQuery project / dataset / table names
+│   - default similarity threshold
+│   - default top K
+│
+├── sql/
+│   BigQuery SQL files (source of truth)
+│
+│   ├── embeddings_backfill.sql
+│   │   One-time or ad-hoc job.
+│   │   Uses CREATE OR REPLACE TABLE to:
+│   │   - read existing conversation data
+│   │   - generate embeddings
+│   │   - create the embeddings table
+│
+│   ├── embeddings_incremental.sql
+│   │   Incremental job.
+│   │   Uses INSERT or MERGE to:
+│   │   - detect new conversations
+│   │   - generate embeddings only for new rows
+│
+│   └── search.sql
+│       Main search query.
+│       - takes a user input string
+│       - generates a query embedding
+│       - computes cosine similarity
+│       - applies a similarity threshold
+│       - returns top K results
+│       (can be extended to hybrid search later)
+│
+├── jobs/
+│   Entry-point scripts that IT can schedule
+│
+│   ├── run_embeddings_backfill.py
+│   │   Executes embeddings_backfill.sql
+│
+│   ├── run_embeddings_incremental.py
+│   │   Executes embeddings_incremental.sql on a schedule
+│
+│   └── run_search.py
+│       Runs search.sql for a given user query
+│
+├── src/
+│   Core Python logic (no scheduling here)
+│
+│   ├── search.py
+│   │   Orchestrates search:
+│   │   - passes user input to BigQuery
+│   │   - controls threshold and top K
+│   │   - handles pagination
+│
+│   ├── clustering.py
+│   │   Optional.
+│   │   Performs Python-based clustering (e.g. KMeans / HDBSCAN)
+│   │   on the search result embeddings.
+│
+│   ├── evaluation.py
+│   │   Offline search quality evaluation.
+│   │   Implements metrics such as:
+│   │   - Precision@K
+│   │   - MRR
+│   │   - Recall@K (optional)
+│
+│   └── utils.py
+│       Small helper functions:
+│       - pagination
+│       - result formatting
+│       - lightweight logging
+│
+├── evaluation/
+│   Search quality evaluation assets
+│
+│   ├── gold_queries.csv
+│   │   Manually curated relevance data:
+│   │   - query text
+│   │   - relevant conversation IDs
+│
+│   └── run_evaluation.py
+│       Runs search over the gold queries and computes metrics
+│
+└── notebooks/
+    Jupyter notebooks for experimentation only
+    
+    ├── embeddings.ipynb
+    │   Inspect and validate embedding quality
+    
+    ├── search.ipynb
+    │   Try different queries, thresholds, and top K values
+    
+    └── evaluation.ipynb
+        Analyze search quality metrics interactively
+
+
+⸻
+
+What This Project Does NOT Do
+	•	❌ No ingestion of raw conversation data
+	•	❌ No UI or frontend
+	•	❌ No scheduling or orchestration logic (handled by IT)
+	•	❌ No online A/B testing
+
+⸻
+
+Evaluation (Why It Exists)
+
+Search quality is measured offline using a small manually curated dataset.
+
+Evaluation answers questions like:
+	•	Are the top results relevant?
+	•	Is the best result ranked near the top?
+	•	Does a change (e.g. threshold or hybrid search) improve results?
+
+Key metrics:
+	•	Precision@K – relevance of top results
+	•	MRR – how early the first relevant result appears
+
+Evaluation is run via:
+
+evaluation/run_evaluation.py
+
+
+⸻
+
+Typical Usage
+	1.	Initial setup
+	•	Run run_embeddings_backfill.py
+	2.	Ongoing updates
+	•	Schedule run_embeddings_incremental.py
+	3.	Search
+	•	Call run_search.py with a user query
+	4.	Quality checks
+	•	Run run_evaluation.py after changes
+
+⸻
+
+One-Line Summary
+
+BigQuery handles embeddings and similarity search; Python handles orchestration, evaluation, and optional clustering.
