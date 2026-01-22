@@ -1,56 +1,122 @@
-You are an expert system for generating BigQuery full-text search WHERE-condition expressions for large-scale conversational analytics.
+-- ============================
+-- All-in-one Lexical + Semantic RRF Search
+-- ============================
 
-The purpose of this system is to transform a short, natural-language topic description into a single executable boolean SQL condition that can be placed directly inside a WHERE clause.
+WITH
+-- --------------------------------------------------
+-- 1) Generate query embedding (semantic search)
+-- --------------------------------------------------
+query_vec AS (
+  SELECT
+    ml_generate_embedding_result AS qvec
+  FROM ML.GENERATE_EMBEDDING(
+    MODEL `D1`,
+    (SELECT '{user_search_string}' AS content),
+    STRUCT(512 AS output_dimensionality, 'RETRIEVAL_QUERY' AS task_type)
+  )
+),
 
-INPUT
-	•	{{USER_SEARCH_STRING}}: a natural-language description of the conversation topic to retrieve
-	•	Target column (already in scope): all_features_concat
-	•	This column is pre-concatenated, lower-cased, and contains customer–bank agent conversation insights.
+-- --------------------------------------------------
+-- 2) Lexical search + ranking
+-- --------------------------------------------------
+lexical AS (
+  SELECT
+    unique_id,
+    time,
+    channel,
+    journey_l3,
+    journey_l4,
+    pain_point,
+    all_features_concat,
 
-ABSOLUTE OUTPUT RULES (NEVER BREAK THESE)
-	1.	Output only a single SQL boolean condition expression.
-	•	No explanations
-	•	No comments
-	•	No markdown
-	•	No formatting
-	2.	Do not output a full SQL query.
-	•	No SELECT, FROM, WITH, GROUP BY, ORDER BY, or LIMIT.
-	3.	Do not reference any table names or aliases.
-	•	Assume all_features_concat is already in scope.
-	4.	Do not infer, invent, or reference any columns other than all_features_concat.
-	5.	Do not generate any time-based, date-based, or recency filters.
-	•	Ignore all temporal language in the input such as “last 5 days”, “recent”, “today”, “this week”.
-	•	Never reference timestamps, dates, partitions, or ingestion time.
+    -- lexical rank
+    ROW_NUMBER() OVER (
+      ORDER BY match_score DESC, time DESC
+    ) AS lexical_rank
+  FROM (
+    SELECT
+      *,
+      (
+        IF(SEARCH(all_features_concat, 'unable to find', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'lose', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'visa', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'lost', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'misplaced', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'mastercard', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'card', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'debit', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'debit card', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'losing', analyzer => 'LOG_ANALYZER'), 1, 0) +
+        IF(SEARCH(all_features_concat, 'missing', analyzer => 'LOG_ANALYZER'), 1, 0)
+      ) AS match_score
+    FROM `TABLE1`
+    WHERE
+      SEARCH(
+        all_features_concat,
+        '((debit card OR debit OR card OR mastercard OR visa)
+          AND (lost OR lose OR losing OR missing OR misplaced OR "unable to find"))',
+        analyzer => 'LOG_ANALYZER'
+      )
+      AND NOT REGEXP_CONTAINS(all_features_concat, '(credit card|loan|mortgage|scam|fraud)')
+  )
+  LIMIT 100
+),
 
-REQUIRED SEARCH LOGIC
-6. Use SEARCH(all_features_concat, , analyzer => ‘LOG_ANALYZER’) as the primary retrieval mechanism.
-7. Build a semantic query that maximizes recall while maintaining precision:
-	•	Use AND for core intent concepts that must co-occur
-	•	Use OR to capture synonyms, plurals and singulars, verb tense variants, paraphrases, domain-specific equivalents, abbreviations, and product names
+-- --------------------------------------------------
+-- 3) Semantic search + ranking
+-- --------------------------------------------------
+semantic AS (
+  SELECT
+    base.unique_id,
+    base.time,
+    base.channel,
+    base.journey_l3,
+    base.journey_l4,
+    base.pain_point,
+    base.all_features_concat,
+    base.distance,
 
-	8.	Do not include common English stop words.
+    ROW_NUMBER() OVER (ORDER BY base.distance ASC) AS semantic_rank
+  FROM VECTOR_SEARCH(
+    TABLE `TABLE1`, 'features_embedd',
+    TABLE query_vec,
+    query_column_to_search => 'qvec',
+    top_k => 1000,
+    distance_type => 'COSINE'
+  ) base
+  WHERE base.distance < {distance_threshold}
+),
 
-PRECISION FILTERING
-9. Use one or more NOT REGEXP_CONTAINS(all_features_concat, ) clauses only to exclude known false positives.
-10. Regex filters must be concept-level (not stylistic), simple and non-greedy, and secondary to SEARCH (never a replacement).
+-- --------------------------------------------------
+-- 4) Reciprocal Rank Fusion
+-- --------------------------------------------------
+rrf AS (
+  SELECT
+    COALESCE(l.unique_id, s.unique_id) AS unique_id,
 
-EXAMPLE 1
-User search string:
-conversations about customers losing debit cards in Paris in the last 5 days
+    -- pick representative metadata
+    COALESCE(l.time, s.time) AS time,
+    COALESCE(l.channel, s.channel) AS channel,
+    COALESCE(l.journey_l3, s.journey_l3) AS journey_l3,
+    COALESCE(l.journey_l4, s.journey_l4) AS journey_l4,
+    COALESCE(l.pain_point, s.pain_point) AS pain_point,
+    COALESCE(l.all_features_concat, s.all_features_concat) AS all_features_concat,
 
-Correct output:
-SEARCH(all_features_concat, ‘((debit card OR debit OR card OR mastercard OR visa) AND (lost OR lose OR losing OR missing OR misplaced OR forgot OR forgotten OR “unable to find”) AND paris)’, analyzer => ‘LOG_ANALYZER’)
-AND NOT REGEXP_CONTAINS(all_features_concat, ‘(credit card|loan|mortgage|scam|fraud)’)
+    -- ranks
+    l.lexical_rank,
+    s.semantic_rank,
 
-EXAMPLE 2
-User search string:
-recent calls about debit card activation not working on the mobile app
+    -- RRF score (k = 60)
+    COALESCE(1.0 / (60 + l.lexical_rank), 0) +
+    COALESCE(1.0 / (60 + s.semantic_rank), 0) AS rrf_score
+  FROM lexical l
+  FULL OUTER JOIN semantic s
+    ON l.unique_id = s.unique_id
+)
 
-Correct output:
-SEARCH(all_features_concat, ‘((debit card OR debit OR card OR mastercard OR visa) AND (activate OR activation OR activated OR enabling OR enable) AND (fail OR failed OR failing OR error OR issue OR problem OR not working) AND (app OR mobile OR application))’, analyzer => ‘LOG_ANALYZER’)
-AND NOT REGEXP_CONTAINS(all_features_concat, ‘(credit card|payment decline|chargeback|loan)’)
-
-FINAL TASK
-Following the exact same structure, constraints, and level of thoroughness shown above, generate the single SQL WHERE-condition expression for:
-
-{{USER_SEARCH_STRING}}
+-- --------------------------------------------------
+-- 5) Final ranking
+-- --------------------------------------------------
+SELECT *
+FROM rrf
+ORDER BY rrf_score DESC;
